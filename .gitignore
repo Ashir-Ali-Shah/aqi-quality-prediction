@@ -1,0 +1,14 @@
+.env
+backend/.env
+backend/__pycache__/
+backend/*.pkl
+frontend/node_modules/
+frontend/build/
+.DS_Store
+.env
+backend/.env
+backend/__pycache__/
+backend/*.pkl
+frontend/node_modules/
+frontend/build/
+.DS_Store

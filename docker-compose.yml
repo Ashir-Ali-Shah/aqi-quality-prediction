@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  # 1. Vector Database
+  weaviate:
+    image: semitechnologies/weaviate:1.24.1  # Pinned to a stable version
+    ports:
+      - "8080:8080"
+      - "50051:50051"
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: 'backup-filesystem' # Enable a dummy module to prevent defaults from loading
+      CLUSTER_HOSTNAME: 'node1'
+    volumes:
+      - weaviate_data:/var/lib/weaviate
+
+  # 2. FastAPI Backend
+  backend:
+    build: ./backend
+    container_name: smog_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - WEAVIATE_URL=http://weaviate:8080
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    depends_on:
+      - weaviate
+    volumes:
+      - ./backend:/app
+
+  # 3. React Frontend
+  frontend:
+    build: ./frontend
+    container_name: smog_frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+volumes:
+  weaviate_data:

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx
+numpy
+pandas
+scikit-learn
+sentence-transformers
+weaviate-client
+joblib
+pydantic
