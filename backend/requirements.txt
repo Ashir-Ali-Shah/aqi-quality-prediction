@@ -8,3 +8,4 @@ sentence-transformers
 weaviate-client
 joblib
 pydantic
+redis[hiredis]

@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback } from 'react';
 import { Cloud, AlertTriangle, TrendingUp, Wind, Thermometer, MapPin, Activity, Zap, Shield, Flame, Target, Layers, MessageSquare, Send, BookOpen, BarChart3, Brain, Sparkles, TrendingDown, AlertCircle, CheckCircle, XCircle, ArrowUp, ArrowDown, Minus, RefreshCw, Gauge, Eye, Droplets, Calculator } from 'lucide-react';
 import { LineChart, Line, AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, Radar, ScatterChart, Scatter, ZAxis, ComposedChart, Cell } from 'recharts';
 
-const GROQ_API_KEY = '';
+const GROQ_API_KEY = process.env.REACT_APP_GROQ_API_KEY || '';
 const BACKEND_URL = 'http://localhost:8000';
 
 const KNOWLEDGE_BASE = [
@@ -85,7 +85,7 @@ class SimpleRAGSystem {
       userPrompt += `- Wind Speed: ${(currentData.wind_speed ?? 0).toFixed(1)} m/s\n\n`;
     }
     
-    userPrompt += `Question: ${query}\n\nProvide a clear, concise answer (3-5 sentences).`;
+    userPrompt += `Question: ${query}\n\nProvide a clear, concise answer (1-2 sentences only).`;
     
     try {
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
@@ -100,8 +100,8 @@ class SimpleRAGSystem {
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
           ],
-          temperature: 0.7,
-          max_tokens: 500
+          temperature: 0.3,
+          max_tokens: 100
         })
       });
       
@@ -125,286 +125,18 @@ class SimpleRAGSystem {
 
 const ragSystem = new SimpleRAGSystem(KNOWLEDGE_BASE);
 
-class SmogDetectionSystem {
-  detectSmog(currentData) {
-    const pm25 = currentData?.pm25 ?? 0;
-    const wind_speed = currentData?.wind_speed ?? 0;
-    const humidity = currentData?.humidity ?? 0;
-    const pressure = currentData?.pressure ?? 0;
-    const temperature = currentData?.temperature ?? 0;
-    let smogScore = 0;
-    let factors = [];
-    
-    if (pm25 > 250) {
-      smogScore += 40;
-      factors.push('Extreme PM2.5 levels');
-    } else if (pm25 > 150) {
-      smogScore += 30;
-      factors.push('Very high PM2.5');
-    } else if (pm25 > 100) {
-      smogScore += 20;
-      factors.push('Elevated PM2.5');
-    }
-    
-    if (wind_speed < 1.5) {
-      smogScore += 25;
-      factors.push('Stagnant air (wind < 1.5 m/s)');
-    } else if (wind_speed < 2.5) {
-      smogScore += 15;
-      factors.push('Low wind speed');
-    }
-    
-    if (humidity > 80) {
-      smogScore += 20;
-      factors.push('Very high humidity');
-    } else if (humidity > 70) {
-      smogScore += 10;
-      factors.push('High humidity');
-    }
-    
-    if (pressure > 1020) {
-      smogScore += 10;
-      factors.push('High atmospheric pressure');
-    }
-    
-    if (temperature < 15) {
-      smogScore += 5;
-      factors.push('Cold temperature');
-    }
-    
-    let severity, color, actions;
-    if (smogScore >= 80) {
-      severity = 'EXTREME';
-      color = '#7f1d1d';
-      actions = ['Stay indoors at all times', 'Use air purifiers continuously', 'Wear N95 masks if must go outside'];
-    } else if (smogScore >= 60) {
-      severity = 'SEVERE';
-      color = '#991b1b';
-      actions = ['Minimize outdoor activities', 'Use air purifiers', 'Wear N95 masks outdoors'];
-    } else if (smogScore >= 40) {
-      severity = 'HIGH';
-      color = '#dc2626';
-      actions = ['Limit outdoor exposure', 'Sensitive groups stay indoors', 'Consider wearing masks'];
-    } else if (smogScore >= 20) {
-      severity = 'MODERATE';
-      color = '#f97316';
-      actions = ['Sensitive individuals limit prolonged outdoor activities', 'Monitor air quality'];
-    } else {
-      severity = 'LOW';
-      color = '#10b981';
-      actions = ['Air quality is acceptable', 'Normal activities can continue'];
-    }
-    
-    return {
-      isSmog: smogScore >= 40,
-      severity,
-      probability: Math.min(smogScore, 100),
-      score: smogScore,
-      factors,
-      color,
-      actions
-    };
-  }
-}
 
-const smogDetector = new SmogDetectionSystem();
 
-class AIInsightsEngine {
-  async analyzeData(currentData, historicalData, forecast) {
-    const insights = {
-      trends: this.detectTrends(historicalData),
-      anomalies: this.detectAnomalies(currentData),
-      correlations: this.findCorrelations(currentData),
-      recommendations: this.generateRecommendations(currentData, forecast)
-    };
-    
-    const aiInterpretation = await this.generateAIInterpretation(currentData, insights);
-    return { ...insights, aiInterpretation };
-  }
-  
-  detectTrends(historicalData) {
-    if (!historicalData || historicalData.length < 2) return null;
-    
-    const latest = historicalData[historicalData.length - 1];
-    const previous = historicalData[0];
-    
-    const pm25Change = ((latest.pm25 - previous.pm25) / previous.pm25) * 100;
-    const aqiChange = ((latest.aqi - previous.aqi) / previous.aqi) * 100;
-    
-    return {
-      pm25Trend: pm25Change > 10 ? 'increasing' : pm25Change < -10 ? 'decreasing' : 'stable',
-      pm25Change: pm25Change.toFixed(1),
-      aqiTrend: aqiChange > 10 ? 'worsening' : aqiChange < -10 ? 'improving' : 'stable',
-      aqiChange: aqiChange.toFixed(1),
-      direction: pm25Change > 0 ? 'up' : pm25Change < 0 ? 'down' : 'stable'
-    };
-  }
-  
-  detectAnomalies(currentData) {
-    const anomalies = [];
-    
-    const pm25 = currentData?.pm25 ?? 0;
-    const wind_speed = currentData?.wind_speed ?? 0;
-    const humidity = currentData?.humidity ?? 0;
-    
-    if (pm25 > 300) {
-      anomalies.push({
-        type: 'critical',
-        metric: 'PM2.5',
-        value: pm25.toFixed(1),
-        message: 'PM2.5 at hazardous levels - immediate action required'
-      });
-    }
-    
-    if (wind_speed < 1.0) {
-      anomalies.push({
-        type: 'warning',
-        metric: 'Wind Speed',
-        value: wind_speed.toFixed(1),
-        message: 'Extremely low wind causing pollutant accumulation'
-      });
-    }
-    
-    if (humidity > 85) {
-      anomalies.push({
-        type: 'warning',
-        metric: 'Humidity',
-        value: humidity.toFixed(0),
-        message: 'Very high humidity may worsen visibility and air quality'
-      });
-    }
-    
-    return anomalies;
-  }
-  
-  findCorrelations(currentData) {
-    const correlations = [];
-    
-    const pm25 = currentData?.pm25 ?? 0;
-    const wind_speed = currentData?.wind_speed ?? 0;
-    const humidity = currentData?.humidity ?? 0;
-    const temperature = currentData?.temperature ?? 0;
-    const pressure = currentData?.pressure ?? 0;
-    
-    if (wind_speed < 2 && pm25 > 150) {
-      correlations.push({
-        factor1: 'Low Wind Speed',
-        factor2: 'High PM2.5',
-        strength: 'Strong',
-        explanation: 'Stagnant air prevents pollutant dispersion'
-      });
-    }
-    
-    if (humidity > 75) {
-      correlations.push({
-        factor1: 'High Humidity',
-        factor2: 'Reduced Visibility',
-        strength: 'Moderate',
-        explanation: 'Moisture causes particles to grow, reducing visibility'
-      });
-    }
-    
-    if (temperature < 15 && pressure > 1020) {
-      correlations.push({
-        factor1: 'Cold + High Pressure',
-        factor2: 'Poor Dispersion',
-        strength: 'Strong',
-        explanation: 'Temperature inversion traps pollutants near ground'
-      });
-    }
-    
-    return correlations;
-  }
-  
-  generateRecommendations(currentData, forecast) {
-    const recommendations = [];
-    
-    const aqi = currentData?.aqi ?? 0;
-    const wind_speed = currentData?.wind_speed ?? 0;
-    
-    if (aqi > 200) {
-      recommendations.push({
-        priority: 'critical',
-        action: 'Stay Indoors',
-        reason: 'AQI in very unhealthy range',
-        duration: 'Until AQI drops below 150'
-      });
-    }
-    
-    if (wind_speed < 2) {
-      recommendations.push({
-        priority: 'high',
-        action: 'Use Air Purifiers',
-        reason: 'Poor natural ventilation',
-        duration: 'Continuously'
-      });
-    }
-    
-    if (forecast && forecast.smog_hours > 24) {
-      recommendations.push({
-        priority: 'high',
-        action: 'Stock N95 Masks',
-        reason: 'Extended smog period expected',
-        duration: 'Next 48 hours'
-      });
-    }
-    
-    return recommendations;
-  }
-  
-  async generateAIInterpretation(currentData, insights) {
-    const prompt = `Based on current air quality data in ${currentData?.city ?? 'Unknown'}:
-- PM2.5: ${(currentData?.pm25 ?? 0).toFixed(1)} µg/m³
-- AQI: ${(currentData?.aqi ?? 0).toFixed(0)}
-- Wind Speed: ${(currentData?.wind_speed ?? 0).toFixed(1)} m/s
-- Humidity: ${(currentData?.humidity ?? 0).toFixed(0)}%
-- Temperature: ${(currentData?.temperature ?? 0).toFixed(1)}°C
-${insights.trends ? `Trend: PM2.5 ${insights.trends.pm25Trend} by ${insights.trends.pm25Change}%` : ''}
 
-Provide a brief 2-3 sentence expert analysis explaining WHY pollution is at current levels, focusing on meteorological and emission factors.`;
-    
-    try {
-      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [
-            { role: 'system', content: 'You are an expert environmental scientist. Provide concise, scientific explanations about air quality.' },
-            { role: 'user', content: prompt }
-          ],
-          temperature: 0.7,
-          max_tokens: 200
-        })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        return data.choices[0].message.content;
-      }
-    } catch (error) {
-      console.error('AI interpretation error:', error);
-    }
-    
-    return 'Current pollution levels are influenced by meteorological conditions and local emissions. Monitor updates for changes.';
-  }
-}
-
-const insightsEngine = new AIInsightsEngine();
 
 export default function SmogSentinelTabs() {
   const [activeTab, setActiveTab] = useState('dashboard');
   const [allCitiesData, setAllCitiesData] = useState({});
   const [currentData, setCurrentData] = useState(null);
   const [forecast, setForecast] = useState(null);
-  const [smogDetection, setSmogDetection] = useState(null);
-  const [aiInsights, setAIInsights] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
-  const [selectedCity, setSelectedCity] = useState('Lahore');
+  const [selectedCity, setSelectedCity] = useState('Islamabad');
   const [lastUpdate, setLastUpdate] = useState(null);
   const [historicalData, setHistoricalData] = useState([]);
   const [chatMessages, setChatMessages] = useState([]);
@@ -495,30 +227,6 @@ export default function SmogSentinelTabs() {
       });
       
       setAllCitiesData(citiesDataMap);
-      
-      if (citiesDataMap[selectedCity]) {
-        const selectedCityData = citiesDataMap[selectedCity];
-        setCurrentData(selectedCityData);
-        
-        const smog = smogDetector.detectSmog(selectedCityData);
-        setSmogDetection(smog);
-        
-        const forecastData = await fetchForecast(selectedCity);
-        setForecast(forecastData);
-        
-        setHistoricalData(prev => {
-          const newHistory = [...prev, selectedCityData];
-          return newHistory.slice(-10);
-        });
-        
-        const insights = await insightsEngine.analyzeData(
-          selectedCityData,
-          historicalData.length > 0 ? historicalData : [selectedCityData],
-          forecastData
-        );
-        setAIInsights(insights);
-      }
-      
       setLastUpdate(new Date());
       setLoading(false);
     } catch (err) {
@@ -526,24 +234,31 @@ export default function SmogSentinelTabs() {
       setError(err.message);
       setLoading(false);
     }
-  }, [selectedCity, fetchCityData, fetchForecast, historicalData]);
+  }, [fetchCityData]);
   
   useEffect(() => {
     fetchAllCitiesData();
-    //const interval = setInterval(fetchAllCitiesData, 300000);
-    //return () => clearInterval(interval);
-  }, []);
+    const interval = setInterval(fetchAllCitiesData, 300000);
+    return () => clearInterval(interval);
+  }, [fetchAllCitiesData]);
   
   useEffect(() => {
     if (allCitiesData[selectedCity]) {
       const selectedCityData = allCitiesData[selectedCity];
       setCurrentData(selectedCityData);
       
-      const smog = smogDetector.detectSmog(selectedCityData);
-      setSmogDetection(smog);
-      
       fetchForecast(selectedCity).then(forecastData => {
         setForecast(forecastData);
+      });
+      
+      setHistoricalData(prev => {
+        const last = prev[prev.length - 1];
+        if (last && last.city === selectedCityData.city && last.pm25 === selectedCityData.pm25) {
+          return prev;
+        }
+        const filteredHistory = prev.filter(item => item.city === selectedCityData.city);
+        const newHistory = [...filteredHistory, selectedCityData];
+        return newHistory.slice(-10);
       });
     }
   }, [selectedCity, allCitiesData, fetchForecast]);
@@ -656,17 +371,82 @@ export default function SmogSentinelTabs() {
     setChatMessages(prev => [...prev, userMsg]);
     setUserQuestion('');
     
-    const relevantDocs = ragSystem.retrieveRelevant(question, 3);
-    const contextData = currentData ? { ...currentData, smogDetection } : null;
-    const result = await ragSystem.generateAnswer(question, relevantDocs, contextData);
+    try {
+      const response = await fetch(`${BACKEND_URL}/rag-query`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          question: question,
+          city: selectedCity,
+          language: 'en',
+          top_k: 3
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error('API request failed');
+      }
+
+      const result = await response.json();
+      
+      // Check if the response is a service unavailable message (Tier 4 degradation)
+      const isServiceUnavailable = result.answer === 'Service not available, try again later!';
+      
+      const assistantMsg = {
+        role: 'assistant',
+        content: result.answer,
+        sources: result.sources,
+        isServiceUnavailable: isServiceUnavailable,
+        timestamp: new Date()
+      };
+      setChatMessages(prev => [...prev, assistantMsg]);
+    } catch (error) {
+      console.error('RAG query error:', error);
+      
+      // --- Graceful Degradation: Frontend fallback ---
+      // Try local RAG system as fallback when backend is unreachable
+      try {
+        const localContext = ragSystem.retrieveRelevant(question, 2);
+        if (localContext.length > 0) {
+          // Synthesize answer from local knowledge base (no LLM needed)
+          const bestDoc = localContext[0];
+          const sentences = bestDoc.content.split('.');
+          const conciseAnswer = sentences.slice(0, 2).join('.').trim() + '.';
+          
+          const assistantMsg = {
+            role: 'assistant',
+            content: conciseAnswer,
+            sources: localContext.map(doc => doc.title),
+            isFallback: true,
+            timestamp: new Date()
+          };
+          setChatMessages(prev => [...prev, assistantMsg]);
+        } else {
+          // No local match either — show service unavailable
+          const assistantMsg = {
+            role: 'assistant',
+            content: 'Service not available, try again later!',
+            sources: [],
+            isServiceUnavailable: true,
+            timestamp: new Date()
+          };
+          setChatMessages(prev => [...prev, assistantMsg]);
+        }
+      } catch (localError) {
+        // Complete failure — Tier 4
+        const assistantMsg = {
+          role: 'assistant',
+          content: 'Service not available, try again later!',
+          sources: [],
+          isServiceUnavailable: true,
+          timestamp: new Date()
+        };
+        setChatMessages(prev => [...prev, assistantMsg]);
+      }
+    }
     
-    const assistantMsg = {
-      role: 'assistant',
-      content: result.answer,
-      sources: result.sources,
-      timestamp: new Date()
-    };
-    setChatMessages(prev => [...prev, assistantMsg]);
     setIsAsking(false);
   };
   
@@ -752,7 +532,7 @@ export default function SmogSentinelTabs() {
                 </div>
                 <div>
                   <h1 className="text-2xl font-bold text-gray-800">Real-Time Smog Detection System</h1>
-                  <p className="text-sm text-gray-500">Live monitoring with AI-powered insights • Updates every 5 minutes</p>
+                  <p className="text-sm text-gray-500">Live air quality monitoring • Auto-updates every 5 minutes</p>
                 </div>
               </div>
               <button
@@ -797,15 +577,7 @@ export default function SmogSentinelTabs() {
               <BarChart3 className="w-5 h-5" />
               Data Visualization
             </button>
-            <button
-              onClick={() => setActiveTab('insights')}
-              className={`flex-1 px-6 py-4 font-semibold text-sm transition-all flex items-center justify-center gap-2 ${
-                activeTab === 'insights' ? 'bg-gradient-to-r from-indigo-500 to-blue-500 text-white' : 'text-gray-600 hover:bg-gray-50'
-              }`}
-            >
-              <Brain className="w-5 h-5" />
-              AI Insights
-            </button>
+
             <button
               onClick={() => setActiveTab('assistant')}
               className={`flex-1 px-6 py-4 font-semibold text-sm transition-all flex items-center justify-center gap-2 ${
@@ -829,49 +601,85 @@ export default function SmogSentinelTabs() {
         
         {activeTab === 'dashboard' && currentData && (
           <div className="space-y-6">
-            {smogDetection && smogDetection.severity !== 'LOW' && (
+            {currentData.smog_severity && (
               <div className="rounded-3xl shadow-xl border-l-4 p-6 bg-white/80 backdrop-blur-sm" style={{
-                borderLeftColor: smogDetection.color
+                borderLeftColor: currentData.smog_color || '#10b981'
               }}>
                 <div className="flex items-start gap-3">
-                  <Flame className="w-8 h-8 flex-shrink-0 mt-1" style={{ color: smogDetection.color }} />
+                  {currentData.smog_severity !== 'LOW' ? (
+                    <Flame className="w-8 h-8 flex-shrink-0 mt-1" style={{ color: currentData.smog_color }} />
+                  ) : (
+                    <CheckCircle className="w-8 h-8 flex-shrink-0 mt-1" style={{ color: currentData.smog_color }} />
+                  )}
                   <div className="flex-1">
-                    <div className="flex items-center gap-3 mb-2">
-                      <h2 className="text-2xl font-bold" style={{ color: smogDetection.color }}>
-                        {smogDetection.severity} SMOG ALERT
-                      </h2>
-                      <span className="px-3 py-1 rounded-full text-sm font-bold text-white shadow-lg" style={{ backgroundColor: smogDetection.color }}>
-                        {smogDetection.probability.toFixed(0)}% Probability
-                      </span>
+                    <div className="flex items-center justify-between mb-2 flex-wrap gap-4">
+                      <div className="flex items-center gap-3">
+                        <h2 className="text-2xl font-bold" style={{ color: currentData.smog_color || '#10b981' }}>
+                          {currentData.smog_severity === 'LOW' ? 'GOOD AIR QUALITY' : `${currentData.smog_severity} SMOG ALERT`}
+                        </h2>
+                        <span className="px-3 py-1 rounded-full text-sm font-bold text-white shadow-lg" style={{ backgroundColor: currentData.smog_color || '#10b981' }}>
+                          {currentData.smog_probability?.toFixed(0) || 0}% Probability
+                        </span>
+                      </div>
+                      
+                      {/* Trend Indicator */}
+                      <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white border border-gray-200 shadow-sm">
+                        <span className="text-sm font-semibold text-gray-700">Trend:</span>
+                        {currentData.smog_trend === 'rising' && <><TrendingUp className="w-4 h-4 text-red-500"/><span className="text-sm font-bold text-red-500">Rising</span></>}
+                        {currentData.smog_trend === 'falling' && <><TrendingDown className="w-4 h-4 text-green-500"/><span className="text-sm font-bold text-green-500">Falling</span></>}
+                        {currentData.smog_trend === 'stable' && <><Minus className="w-4 h-4 text-yellow-500"/><span className="text-sm font-bold text-yellow-600">Stable</span></>}
+                      </div>
                     </div>
+                    
                     <p className="text-gray-700 mb-4 font-medium">
-                      Smog conditions detected in {selectedCity}. Risk Score: {smogDetection.score}/100
+                      {currentData.smog_severity === 'LOW' 
+                        ? `Air conditions in ${selectedCity} are currently clear. Risk Score: ${currentData.smog_score?.toFixed(0) || 0}/100`
+                        : `Smog conditions detected in ${selectedCity}. Risk Score: ${currentData.smog_score?.toFixed(0) || 0}/100`}
                     </p>
+                    
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                      <div className="bg-gradient-to-br from-orange-50 to-red-50 rounded-2xl p-4 border border-orange-200">
-                        <h3 className="font-semibold text-sm mb-2" style={{ color: smogDetection.color }}>
-                          Contributing Factors:
+                      <div className={`rounded-2xl p-4 border ${currentData.smog_severity === 'LOW' ? 'bg-green-50 border-green-200' : 'bg-gradient-to-br from-orange-50 to-red-50 border-orange-200'}`}>
+                        <h3 className="font-semibold text-sm mb-2" style={{ color: currentData.smog_color || '#10b981' }}>
+                          {currentData.smog_severity === 'LOW' ? 'Current Conditions:' : 'Contributing Factors:'}
                         </h3>
                         <ul className="space-y-1">
-                          {smogDetection.factors.map((factor, idx) => (
+                          {(currentData.smog_factors || []).map((factor, idx) => (
                             <li key={idx} className="text-sm text-gray-700 flex items-center gap-2">
-                              <Target className="w-3 h-3" style={{ color: smogDetection.color }} />
+                              <Target className="w-3 h-3" style={{ color: currentData.smog_color || '#10b981' }} />
                               {factor}
                             </li>
                           ))}
+                          {(!currentData.smog_factors || currentData.smog_factors.length === 0) && (
+                            <li className="text-sm text-gray-700 flex items-center gap-2">
+                              <Target className="w-3 h-3 text-green-500" />
+                              Optimal weather and low pollutants
+                            </li>
+                          )}
                         </ul>
                       </div>
-                      <div className="bg-gradient-to-br from-blue-50 to-indigo-50 rounded-2xl p-4 border border-blue-200">
-                        <h3 className="font-semibold text-sm mb-2" style={{ color: smogDetection.color }}>
-                          Recommended Actions:
+                      <div className={`rounded-2xl p-4 border ${currentData.smog_severity === 'LOW' ? 'bg-blue-50 border-blue-200' : 'bg-gradient-to-br from-blue-50 to-indigo-50 border-blue-200'}`}>
+                        <h3 className="font-semibold text-sm mb-2" style={{ color: currentData.smog_color || '#10b981' }}>
+                          Proactive Recommendations:
                         </h3>
                         <ul className="space-y-1">
-                          {smogDetection.actions.slice(0, 3).map((action, idx) => (
+                          {(currentData.smog_actions || []).slice(0, 3).map((action, idx) => (
                             <li key={idx} className="text-sm text-gray-700 flex items-center gap-2">
-                              <Shield className="w-3 h-3" style={{ color: smogDetection.color }} />
+                              <Shield className="w-3 h-3" style={{ color: currentData.smog_color || '#10b981' }} />
                               {action}
                             </li>
                           ))}
+                          {currentData.smog_trend === 'rising' && (
+                            <li className="text-sm text-red-600 font-medium flex items-center gap-2 mt-2 pt-2 border-t border-red-100">
+                              <AlertCircle className="w-3 h-3" />
+                              Peak particle trapping expected. Avoid outdoor exercise.
+                            </li>
+                          )}
+                          {currentData.smog_trend === 'falling' && (
+                            <li className="text-sm text-green-600 font-medium flex items-center gap-2 mt-2 pt-2 border-t border-green-100">
+                              <Sparkles className="w-3 h-3" />
+                              Conditions improving. Safe for outdoor activities soon.
+                            </li>
+                          )}
                         </ul>
                       </div>
                     </div>
@@ -1187,115 +995,7 @@ export default function SmogSentinelTabs() {
             )}
           </div>
         )}
-        
-        {activeTab === 'insights' && currentData && aiInsights && (
-          <div className="space-y-6">
-            <div className="bg-gradient-to-br from-purple-50 to-pink-50 rounded-2xl shadow-lg border border-purple-200 p-6">
-              <div className="flex items-center gap-3 mb-4">
-                <div className="w-10 h-10 bg-gradient-to-br from-purple-500 to-pink-500 rounded-lg flex items-center justify-center">
-                  <Brain className="w-6 h-6 text-white" />
-                </div>
-                <div>
-                  <h2 className="text-xl font-bold text-gray-800">AI-Powered Insights Engine</h2>
-                  <p className="text-sm text-gray-600">Real-time trend detection & analysis</p>
-                </div>
-              </div>
-              
-              {aiInsights.aiInterpretation && (
-                <div className="bg-white/70 rounded-xl p-4 mb-4">
-                  <div className="flex items-start gap-2">
-                    <Sparkles className="w-5 h-5 text-purple-600 flex-shrink-0 mt-0.5" />
-                    <div>
-                      <h3 className="font-semibold text-purple-900 mb-2">🤖 AI Expert Analysis</h3>
-                      <p className="text-sm text-gray-700 leading-relaxed">{aiInsights.aiInterpretation}</p>
-                    </div>
-                  </div>
-                </div>
-              )}
-              
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {aiInsights.trends && (
-                  <div className="bg-white/70 rounded-xl p-4">
-                    <div className="flex items-start gap-2 mb-3">
-                      <TrendingUp className="w-5 h-5 text-blue-600" />
-                      <h3 className="font-semibold text-gray-800">Detected Trends</h3>
-                    </div>
-                    <div className="space-y-3">
-                      <div className="bg-blue-50 rounded-lg p-3">
-                        <p className="text-xs text-gray-600 mb-1">PM2.5 Trend</p>
-                        <div className="flex items-center gap-2">
-                          {aiInsights.trends.direction === 'up' && <ArrowUp className="w-4 h-4 text-red-600" />}
-                          {aiInsights.trends.direction === 'down' && <ArrowDown className="w-4 h-4 text-green-600" />}
-                          {aiInsights.trends.direction === 'stable' && <Minus className="w-4 h-4 text-gray-600" />}
-                          <span className={`text-lg font-bold ${
-                            aiInsights.trends.direction === 'up' ? 'text-red-600' :
-                            aiInsights.trends.direction === 'down' ? 'text-green-600' : 'text-gray-600'
-                          }`}>
-                            {aiInsights.trends.pm25Change}%
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-600 mt-1 capitalize">{aiInsights.trends.pm25Trend}</p>
-                      </div>
-                    </div>
-                  </div>
-                )}
-                
-                <div className="bg-white/70 rounded-xl p-4">
-                  <div className="flex items-start gap-2 mb-3">
-                    <AlertCircle className="w-5 h-5 text-orange-600" />
-                    <h3 className="font-semibold text-gray-800">Anomalies</h3>
-                  </div>
-                  {aiInsights.anomalies && aiInsights.anomalies.length > 0 ? (
-                    <div className="space-y-2">
-                      {aiInsights.anomalies.map((anomaly, idx) => (
-                        <div key={idx} className={`p-2 rounded-lg ${
-                          anomaly.type === 'critical' ? 'bg-red-50' :
-                          anomaly.type === 'warning' ? 'bg-orange-50' : 'bg-blue-50'
-                        }`}>
-                          <p className="text-xs font-semibold text-gray-800">{anomaly.metric}: {anomaly.value}</p>
-                          <p className="text-xs text-gray-600">{anomaly.message}</p>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="flex items-center gap-2 text-green-600 bg-green-50 p-3 rounded-lg">
-                      <CheckCircle className="w-4 h-4" />
-                      <p className="text-xs">No critical anomalies</p>
-                    </div>
-                  )}
-                </div>
-              </div>
-              
-              {aiInsights.recommendations && aiInsights.recommendations.length > 0 && (
-                <div className="bg-white/70 rounded-xl p-4 mt-4">
-                  <div className="flex items-start gap-2 mb-3">
-                    <CheckCircle className="w-5 h-5 text-indigo-600" />
-                    <h3 className="font-semibold text-gray-800">Smart Recommendations</h3>
-                  </div>
-                  <div className="space-y-2">
-                    {aiInsights.recommendations.map((rec, idx) => (
-                      <div key={idx} className={`p-3 rounded-lg ${
-                        rec.priority === 'critical' ? 'bg-red-50 border border-red-200' :
-                        rec.priority === 'high' ? 'bg-orange-50 border border-orange-200' : 'bg-blue-50 border border-blue-200'
-                      }`}>
-                        <div className="flex items-start justify-between mb-1">
-                          <p className="text-sm font-bold text-gray-800">{rec.action}</p>
-                          <span className={`text-xs px-2 py-0.5 rounded-full uppercase font-bold ${
-                            rec.priority === 'critical' ? 'bg-red-200 text-red-900' :
-                            rec.priority === 'high' ? 'bg-orange-200 text-orange-900' : 'bg-blue-200 text-blue-900'
-                          }`}>
-                            {rec.priority}
-                          </span>
-                        </div>
-                        <p className="text-xs text-gray-600">{rec.reason}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        )}
+
         
         {activeTab === 'assistant' && (
           <div className="space-y-6">
@@ -1343,9 +1043,35 @@ export default function SmogSentinelTabs() {
                           <div className={`rounded-lg p-3 ${
                             msg.role === 'user'
                               ? 'bg-indigo-500 text-white'
-                              : 'bg-gray-100 text-gray-800'
+                              : msg.isServiceUnavailable
+                                ? 'bg-red-50 text-red-700 border border-red-200'
+                                : msg.isFallback
+                                  ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                                  : 'bg-gray-100 text-gray-800'
                           }`}>
+                            {msg.isServiceUnavailable && (
+                              <div className="flex items-center gap-2 mb-2">
+                                <AlertCircle className="w-4 h-4 text-red-500" />
+                                <span className="text-xs font-semibold text-red-600">Service Unavailable</span>
+                              </div>
+                            )}
+                            {msg.isFallback && (
+                              <div className="flex items-center gap-2 mb-2">
+                                <AlertTriangle className="w-4 h-4 text-amber-500" />
+                                <span className="text-xs font-semibold text-amber-600">Offline Answer (from local knowledge base)</span>
+                              </div>
+                            )}
                             <p className="text-sm">{msg.content}</p>
+                            {msg.isServiceUnavailable && (
+                              <button
+                                onClick={() => handleAskQuestion(chatMessages.filter(m => m.role === 'user').pop()?.content || '')}
+                                className="mt-2 text-xs bg-red-100 hover:bg-red-200 text-red-700 px-3 py-1 rounded-full transition-colors flex items-center gap-1"
+                                disabled={isAsking}
+                              >
+                                <RefreshCw className="w-3 h-3" />
+                                Retry
+                              </button>
+                            )}
                           </div>
                           {msg.sources && msg.sources.length > 0 && (
                             <div className="mt-1 flex flex-wrap gap-1">

@@ -3,7 +3,7 @@ version: '3.8'
 services:
   # 1. Vector Database
   weaviate:
-    image: semitechnologies/weaviate:1.24.1  # Pinned to a stable version
+    image: semitechnologies/weaviate:1.27.0  # Upgraded to supported version
     ports:
       - "8080:8080"
       - "50051:50051"
@@ -13,11 +13,23 @@ services:
       PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
       DEFAULT_VECTORIZER_MODULE: 'none'
       ENABLE_MODULES: 'backup-filesystem' # Enable a dummy module to prevent defaults from loading
+      BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backups'
       CLUSTER_HOSTNAME: 'node1'
+      CLUSTER_ADVERTISE_ADDRESS: 'weaviate'
     volumes:
       - weaviate_data:/var/lib/weaviate
 
-  # 2. FastAPI Backend
+  # 2. Redis Cache (for FAQ query caching)
+  redis:
+    image: redis:7-alpine
+    container_name: smog_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+
+  # 3. FastAPI Backend
   backend:
     build: ./backend
     container_name: smog_backend
@@ -26,12 +38,15 @@ services:
     environment:
       - WEAVIATE_URL=http://weaviate:8080
       - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENWEATHER_API_KEY=${OPENWEATHER_API_KEY}
+      - REDIS_URL=redis://redis:6379
     depends_on:
       - weaviate
+      - redis
     volumes:
       - ./backend:/app
 
-  # 3. React Frontend
+  # 4. React Frontend
   frontend:
     build: ./frontend
     container_name: smog_frontend
@@ -42,3 +57,4 @@ services:
 
 volumes:
   weaviate_data:
+  redis_data:

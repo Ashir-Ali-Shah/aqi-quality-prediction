@@ -1,6 +1,7 @@
 """
 Enhanced FastAPI Backend with RAG Implementation using Weaviate
 Real-time air quality data from OpenWeatherMap + Weaviate vector store + Sentence Transformers + Groq LLM
+Features: Redis FAQ caching, Graceful Degradation, Concise RAG output
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -15,9 +16,22 @@ import numpy as np
 import pandas as pd
 from collections import deque
 import json
+import hashlib
 import warnings
 warnings.filterwarnings('ignore')
 import joblib
+import redis
+import requests
+import socket
+
+# Monkey-patch socket to force IPv4 to prevent 5-second Docker Desktop IPv6 DNS timeouts
+orig_getaddrinfo = socket.getaddrinfo
+def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = getaddrinfo_ipv4
+
+import os
+os.environ["GRPC_DNS_RESOLVER"] = "native"
 
 # ML and RAG imports
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingClassifier
@@ -123,6 +137,80 @@ def get_aqi_category_and_message(aqi):
     else:
         return "Hazardous", "Health warning of emergency conditions: everyone is more likely to be affected. Stay indoors and avoid all outdoor activities."
 
+def calculate_smog_risk(pm25, wind_speed, humidity, pressure, temperature):
+    smogScore = 0.0
+    factors = []
+    
+    # 1. Base PM2.5 continuous scoring (e.g., 50 -> 10 pts, 200 -> 40 pts)
+    pm25_score = pm25 * 0.20
+    smogScore += pm25_score
+    if pm25 > 150:
+        factors.append(f'Hazardous PM2.5 levels ({pm25:.1f} µg/m³)')
+    elif pm25 > 50:
+        factors.append(f'Elevated PM2.5 ({pm25:.1f} µg/m³)')
+        
+    # 2. Wind speed penalty: Inversely proportional (Stagnant air traps smog)
+    # E.g., 0 m/s -> 28 pts, 3.5+ m/s -> 0 pts
+    wind_score = max(0.0, (3.5 - wind_speed) * 8.0)
+    smogScore += wind_score
+    if wind_speed < 2.0:
+        factors.append(f'Stagnant air (wind: {wind_speed:.1f} m/s)')
+            
+    # 3. Humidity penalty: Linear increase above 50%
+    # E.g., 50% -> 0 pts, 90% -> 20 pts
+    humidity_score = max(0.0, (humidity - 50) * 0.5)
+    smogScore += humidity_score
+    if humidity > 75:
+        factors.append(f'High humidity trapping pollutants ({humidity:.1f}%)')
+            
+    # 4. Temperature inversion risk (Compound factor: High humidity + Low Wind)
+    if wind_speed < 2.0 and humidity > 70:
+        inversion_multiplier = ((2.0 - wind_speed) / 2.0) * ((humidity - 70) / 30.0) 
+        inversion_penalty = inversion_multiplier * 30.0  # Up to 30 extra points
+        smogScore += inversion_penalty
+        factors.append('Conditions favorable for temperature inversion')
+
+    # 5. Pressure: High pressure systems trap air
+    pressure_score = max(0.0, (pressure - 1010) * 1.0)
+    smogScore += min(15.0, pressure_score)  # Cap pressure impact at 15
+        
+    # 6. Temperature: Cold air can trap pollutants
+    temp_score = max(0.0, (20 - temperature) * 0.5)
+    smogScore += temp_score
+        
+    # Cap score at 100
+    smogScore = min(smogScore, 100.0)
+        
+    if smogScore >= 80:
+        severity = 'EXTREME'
+        color = '#7f1d1d'
+        actions = ['Stay indoors at all times', 'Use air purifiers continuously', 'Wear N95 masks if must go outside']
+    elif smogScore >= 60:
+        severity = 'SEVERE'
+        color = '#991b1b'
+        actions = ['Minimize outdoor activities', 'Use air purifiers', 'Wear N95 masks outdoors']
+    elif smogScore >= 40:
+        severity = 'HIGH'
+        color = '#dc2626'
+        actions = ['Limit outdoor exposure', 'Sensitive groups stay indoors', 'Consider wearing masks']
+    elif smogScore >= 20:
+        severity = 'MODERATE'
+        color = '#f97316'
+        actions = ['Sensitive individuals limit prolonged outdoor activities', 'Monitor air quality']
+    else:
+        severity = 'LOW'
+        color = '#10b981'
+        actions = ['Air quality is acceptable', 'Normal activities can continue']
+        
+    return {
+        'smog_score': float(smogScore),
+        'smog_severity': severity,
+        'smog_probability': float(smogScore),
+        'smog_color': color,
+        'smog_factors': factors,
+        'smog_actions': actions
+    }
+
 # ============================================================================
 # Pydantic Models - Define BEFORE FastAPI app
 # ============================================================================
@@ -160,10 +248,17 @@ class AirQualityResponse(BaseModel):
     visibility: float
     aqi: float
     is_smog_emergency: bool
+    smog_score: float
+    smog_severity: str
+    smog_probability: float
+    smog_color: str
+    smog_factors: List[str]
+    smog_actions: List[str]
+    smog_trend: str
 
 class RAGQueryRequest(BaseModel):
     question: str
-    city: Optional[str] = "Lahore"
+    city: Optional[str] = "Islamabad"
     language: str = "en"
     top_k: int = 3
 
@@ -309,8 +404,13 @@ class WeaviateRAGSystem:
                     auth_credentials=Auth.api_key(WEAVIATE_API_KEY)
                 )
             else:
+                host_str = WEAVIATE_URL.replace('http://', '').replace('https://', '').split(':')[0]
+                try:
+                    ip_addr = socket.gethostbyname(host_str)
+                except:
+                    ip_addr = host_str
                 self.weaviate_client = weaviate.connect_to_local(
-                    host=WEAVIATE_URL.replace('http://', '').replace('https://', '').split(':')[0],
+                    host=ip_addr,
                     port=int(WEAVIATE_URL.split(':')[-1]) if ':' in WEAVIATE_URL.split('//')[-1] else 8080
                 )
 
@@ -431,61 +531,75 @@ class WeaviateRAGSystem:
         query: str,
         context_docs: List[Dict],
         current_data: Optional[Dict] = None,
-        language: str = 'en'
+        language: str = 'en',
+        all_cities_data: Optional[List[Dict]] = None
     ) -> Dict:
-        """Generate answer using Groq LLM with retrieved context"""
+        """Generate answer using Groq LLM with retrieved context — concise output to save tokens"""
 
         system_prompt = """You are an expert environmental scientist specializing in air quality and public health in Pakistan.
-Use the provided context to answer questions accurately and concisely.
-If the context doesn't contain the answer, use your knowledge but mention when you're going beyond the provided information.
-Always prioritize actionable advice for public health protection."""
+Use the provided context to answer questions accurately.
+CRITICAL RULES:
+- Answer in 1-2 sentences MAXIMUM. Be extremely concise.
+- No introductions, no filler, no repetition.
+- Note that Islamabad, Lahore, Pindi (Rawalpindi) etc. are CITIES in Pakistan.
+- Include specific numbers from the data when relevant.
+- Provide one actionable recommendation if applicable.
+- Do not hallucinate."""
 
         user_prompt = "Context from knowledge base:\n\n"
         for idx, doc in enumerate(context_docs, 1):
             user_prompt += f"[Source {idx}: {doc['title']}]\n{doc['content']}\n\n"
 
-        if current_data:
+        if all_cities_data:
+            user_prompt += "\nCurrent Real-time Data for mentioned cities:\n"
+            for data in all_cities_data:
+                user_prompt += f"- {data.get('city')}: PM2.5: {data.get('pm25', 0):.1f} µg/m³ | AQI: {data.get('aqi', 0):.0f} | Temp: {data.get('temperature', 0):.1f}°C\n"
+            user_prompt += "\n"
+        elif current_data:
             user_prompt += f"\nCurrent Real-time Data for {current_data.get('city', 'Unknown')}:\n"
             user_prompt += f"- PM2.5: {current_data.get('pm25', 0):.1f} µg/m³\n"
             user_prompt += f"- AQI: {current_data.get('aqi', 0):.0f}\n"
             user_prompt += f"- Temperature: {current_data.get('temperature', 0):.1f}°C\n"
             user_prompt += f"- Humidity: {current_data.get('humidity', 0):.0f}%\n\n"
 
-        user_prompt += f"Question: {query}\n\nProvide a clear, concise answer (3-5 sentences) based on the context and current data."
+        user_prompt += f"Question: {query}\n\nProvide a very concise answer (1-2 sentences only) based on the context and current data."
 
         try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                response = await client.post(
+            def sync_call():
+                return requests.post(
                     "https://api.groq.com/openai/v1/chat/completions",
                     headers={
                         "Authorization": f"Bearer {GROQ_API_KEY}",
                         "Content-Type": "application/json"
                     },
                     json={
-                        "model": "llama-3.3-70b-versatile",
+                        "model": "llama-3.1-8b-instant",
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": user_prompt}
                         ],
-                        "temperature": 0.7,
-                        "max_tokens": 500,
+                        "temperature": 0.3,
+                        "max_tokens": 100,
                         "top_p": 0.9
-                    }
+                    },
+                    timeout=20.0
                 )
+                
+            response = await asyncio.to_thread(sync_call)
 
-                if response.status_code == 200:
-                    result = response.json()
-                    answer = result['choices'][0]['message']['content']
+            if response.status_code == 200:
+                result = response.json()
+                answer = result['choices'][0]['message']['content']
 
-                    return {
-                        'answer': answer,
-                        'sources': [doc['title'] for doc in context_docs],
-                        'source_ids': [doc['id'] for doc in context_docs],
-                        'similarity_scores': [doc.get('similarity_score', 0) for doc in context_docs],
-                        'success': True
-                    }
-                else:
-                    raise Exception(f"Groq API error: {response.status_code}")
+                return {
+                    'answer': answer,
+                    'sources': [doc['title'] for doc in context_docs],
+                    'source_ids': [doc['id'] for doc in context_docs],
+                    'similarity_scores': [doc.get('similarity_score', 0) for doc in context_docs],
+                    'success': True
+                }
+            else:
+                raise Exception(f"Groq API error: {response.status_code}")
 
         except Exception as e:
             print(f"Error generating answer: {e}")
@@ -506,6 +620,217 @@ Always prioritize actionable advice for public health protection."""
 
 # Initialize RAG system globally
 rag_system = WeaviateRAGSystem(KNOWLEDGE_BASE)
+
+# ============================================================================
+# Redis Cache Service (Single Responsibility: FAQ Query Caching)
+# ============================================================================
+
+class RedisCacheService:
+    """Handles caching of frequently asked RAG queries using Redis.
+    Follows Single Responsibility Principle — only manages cache operations.
+    """
+
+    def __init__(self, redis_url: str = None):
+        self.redis_url = redis_url or os.getenv('REDIS_URL', 'redis://localhost:6379')
+        self.client = None
+        self.is_connected = False
+        self.default_ttl = 3600  # 1 hour TTL for cached FAQ responses
+
+    def connect(self):
+        """Establish connection to Redis"""
+        try:
+            self.client = redis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=5
+            )
+            self.client.ping()
+            self.is_connected = True
+            print(f"✅ Redis connected at {self.redis_url}")
+        except Exception as e:
+            print(f"⚠️ Redis connection failed: {e}. Continuing without cache.")
+            self.is_connected = False
+
+    def _normalize_query(self, question: str, city: str = "") -> str:
+        """Normalize query for consistent cache keys.
+        Lowercases, strips whitespace, sorts words for order-independent matching.
+        """
+        normalized = question.lower().strip()
+        # Sort words for order-independent matching
+        words = sorted(normalized.split())
+        key_string = f"{' '.join(words)}:{city.lower().strip()}"
+        return hashlib.sha256(key_string.encode()).hexdigest()
+
+    def get_cached_response(self, question: str, city: str = "") -> Optional[Dict]:
+        """Retrieve cached RAG response if available"""
+        if not self.is_connected:
+            return None
+        try:
+            cache_key = f"rag_cache:{self._normalize_query(question, city)}"
+            cached = self.client.get(cache_key)
+            if cached:
+                print(f"✅ Redis CACHE HIT for query: '{question[:50]}...'")
+                return json.loads(cached)
+            return None
+        except Exception as e:
+            print(f"⚠️ Redis GET error: {e}")
+            return None
+
+    def cache_response(self, question: str, city: str, response: Dict, ttl: int = None) -> bool:
+        """Cache a RAG response in Redis"""
+        if not self.is_connected:
+            return False
+        try:
+            cache_key = f"rag_cache:{self._normalize_query(question, city)}"
+            self.client.setex(
+                cache_key,
+                ttl or self.default_ttl,
+                json.dumps(response)
+            )
+            print(f"✅ Redis CACHED response for query: '{question[:50]}...'")
+            return True
+        except Exception as e:
+            print(f"⚠️ Redis SET error: {e}")
+            return False
+
+    def close(self):
+        """Close Redis connection"""
+        if self.client:
+            self.client.close()
+            print("✅ Redis connection closed")
+
+# Initialize Redis cache service globally
+redis_cache = RedisCacheService()
+
+# ============================================================================
+# Graceful Degradation Service (Single Responsibility: Fallback Logic)
+# ============================================================================
+
+class GracefulDegradationService:
+    """Provides tiered fallback when APIs fail.
+    Follows Single Responsibility Principle — only manages degradation logic.
+    
+    Tiers:
+      1. Full RAG pipeline (Weaviate + Groq LLM)
+      2. Weaviate-only (return retrieved docs without LLM)
+      3. Local keyword search against KNOWLEDGE_BASE
+      4. "Service not available, try again later!"
+    """
+
+    def __init__(self, knowledge_base: List[Dict]):
+        self.knowledge_base = knowledge_base
+
+    def keyword_search(self, query: str, top_k: int = 2) -> List[Dict]:
+        """Tier 3: Local keyword-based search when Weaviate is unavailable"""
+        query_tokens = query.lower().split()
+        scored = []
+
+        for doc in self.knowledge_base:
+            score = 0
+            doc_text = (doc['content'] + ' ' + doc['title'] + ' ' + ' '.join(doc['keywords'])).lower()
+            for token in query_tokens:
+                if any(token in kw for kw in doc['keywords']):
+                    score += 3
+                if token in doc['title'].lower():
+                    score += 2
+                score += doc_text.count(token) * 0.5
+            if score > 0:
+                scored.append({**doc, 'score': score})
+
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        return scored[:top_k]
+
+    def synthesize_from_docs(self, docs: List[Dict], query: str) -> str:
+        """Tier 2: Create a concise answer from retrieved documents without LLM"""
+        if not docs:
+            return self.service_unavailable_message()
+
+        # Pick the most relevant document and return a trimmed snippet
+        best_doc = docs[0]
+        content = best_doc['content']
+        # Return first 2 sentences for conciseness
+        sentences = content.split('.')
+        concise = '. '.join(sentences[:2]).strip()
+        if concise and not concise.endswith('.'):
+            concise += '.'
+        return concise
+
+    def service_unavailable_message(self) -> str:
+        """Tier 4: Final fallback message"""
+        return "Service not available, try again later!"
+
+    async def execute_with_fallback(
+        self,
+        rag_system,
+        query: str,
+        city: str,
+        top_k: int,
+        current_data: Optional[Dict] = None,
+        all_cities_data: Optional[List[Dict]] = None,
+        language: str = 'en'
+    ) -> Dict:
+        """Execute RAG query with tiered graceful degradation"""
+
+        # --- Tier 1: Full RAG pipeline (Weaviate + Groq) ---
+        try:
+            import time
+            import logging
+            if rag_system.is_initialized:
+                t0 = time.time()
+                relevant_docs = rag_system.retrieve_relevant(query, top_k=top_k)
+                t1 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING RAG TIER1: retrieve_relevant took {t1-t0:.3f}s\n")
+                if relevant_docs:
+                    result = await rag_system.generate_answer(
+                        query, relevant_docs, current_data, language, all_cities_data
+                    )
+                    t2 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING RAG TIER1: generate_answer took {t2-t1:.3f}s\n")
+                    if result.get('success'):
+                        return {
+                            'answer': result['answer'],
+                            'sources': result['sources'],
+                            'source_ids': result['source_ids'],
+                            'similarity_scores': result['similarity_scores'],
+                            'tier': 1
+                        }
+                    # Groq failed but we have docs — fall to Tier 2
+                    print("⚠️ Tier 1 failed (LLM error). Falling back to Tier 2.")
+                    answer = self.synthesize_from_docs(relevant_docs, query)
+                    return {
+                        'answer': answer,
+                        'sources': [doc['title'] for doc in relevant_docs],
+                        'source_ids': [doc['id'] for doc in relevant_docs],
+                        'similarity_scores': [doc.get('similarity_score', 0) for doc in relevant_docs],
+                        'tier': 2
+                    }
+        except Exception as e:
+            print(f"⚠️ Tier 1 & 2 failed: {e}. Falling back to Tier 3.")
+
+        # --- Tier 3: Local keyword search ---
+        try:
+            local_docs = self.keyword_search(query, top_k=2)
+            if local_docs:
+                answer = self.synthesize_from_docs(local_docs, query)
+                return {
+                    'answer': answer,
+                    'sources': [doc['title'] for doc in local_docs],
+                    'source_ids': [doc['id'] for doc in local_docs],
+                    'similarity_scores': [],
+                    'tier': 3
+                }
+        except Exception as e:
+            print(f"⚠️ Tier 3 failed: {e}. Falling back to Tier 4.")
+
+        # --- Tier 4: Service unavailable ---
+        return {
+            'answer': self.service_unavailable_message(),
+            'sources': [],
+            'source_ids': [],
+            'similarity_scores': [],
+            'tier': 4
+        }
+
+# Initialize graceful degradation service globally
+degradation_service = GracefulDegradationService(KNOWLEDGE_BASE)
 
 # ============================================================================
 # ML Pipeline
@@ -680,53 +1005,69 @@ async def fetch_air_quality_data(lat: float, lon: float) -> Dict:
     url = f"{OPENWEATHER_BASE}/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}"
 
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            data = response.json()
-
-            cache[cache_key] = {
-                'data': data,
-                'timestamp': datetime.now().timestamp()
-            }
-
-            return data
+        response = await asyncio.to_thread(requests.get, url, timeout=15.0)
+        response.raise_for_status()
+        data = response.json()
+        
+        cache[cache_key] = {
+            'data': data,
+            'timestamp': datetime.now().timestamp()
+        }
+        return data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to fetch air quality data: {str(e)}")
 
 async def fetch_air_quality_forecast(lat: float, lon: float) -> Dict:
     """Fetch air quality forecast from OpenWeatherMap"""
-    url = f"{OPENWEATHER_BASE}/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}"
+    cache_key = f"air_forecast:{lat}:{lon}"
+    if cache_key in cache:
+        entry = cache[cache_key]
+        if (datetime.now().timestamp() - entry['timestamp']) < CACHE_TTL:
+            return entry['data']
 
+    url = f"{OPENWEATHER_BASE}/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
+        response = await asyncio.to_thread(requests.get, url, timeout=15.0)
+        response.raise_for_status()
+        data = response.json()
+        cache[cache_key] = {'data': data, 'timestamp': datetime.now().timestamp()}
+        return data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to fetch air quality forecast: {str(e)}")
 
 async def fetch_weather_data(lat: float, lon: float) -> Dict:
     """Fetch weather data from OpenWeatherMap"""
-    url = f"{OPENWEATHER_BASE}/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
+    cache_key = f"weather:{lat}:{lon}"
+    if cache_key in cache:
+        entry = cache[cache_key]
+        if (datetime.now().timestamp() - entry['timestamp']) < CACHE_TTL:
+            return entry['data']
 
+    url = f"{OPENWEATHER_BASE}/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
+        response = await asyncio.to_thread(requests.get, url, timeout=15.0)
+        response.raise_for_status()
+        data = response.json()
+        cache[cache_key] = {'data': data, 'timestamp': datetime.now().timestamp()}
+        return data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to fetch weather data: {str(e)}")
 
 async def fetch_weather_forecast(lat: float, lon: float) -> Dict:
     """Fetch weather forecast from OpenWeatherMap"""
-    url = f"{OPENWEATHER_BASE}/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
+    cache_key = f"weather_forecast:{lat}:{lon}"
+    if cache_key in cache:
+        entry = cache[cache_key]
+        if (datetime.now().timestamp() - entry['timestamp']) < CACHE_TTL:
+            return entry['data']
 
+    url = f"{OPENWEATHER_BASE}/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            return response.json()
+        response = await asyncio.to_thread(requests.get, url, timeout=15.0)
+        response.raise_for_status()
+        data = response.json()
+        cache[cache_key] = {'data': data, 'timestamp': datetime.now().timestamp()}
+        return data
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Failed to fetch weather forecast: {str(e)}")
 
@@ -786,16 +1127,57 @@ def parse_responses(air_data: Dict, weather_data: Dict, air_forecast: Dict, weat
         raise HTTPException(status_code=500, detail=f"Error parsing data: {str(e)}")
 
 # ============================================================================
+# Background Tasks
+# ============================================================================
+
+async def prefetch_all_city_data():
+    """Periodically fetch and cache data for all cities in the background"""
+    while True:
+        print("🔄 Pre-fetching data for all cities to ensure <300ms latency...")
+        for city, coords in PAKISTAN_CITIES.items():
+            try:
+                # Force fetch bypassing cache logic temporarily just to update it
+                lat, lon = coords['lat'], coords['lon']
+                
+                # 1. Current Air Quality
+                r1 = await asyncio.to_thread(requests.get, f"{OPENWEATHER_BASE}/air_pollution?lat={lat}&lon={lon}&appid={API_KEY}", timeout=10.0)
+                if r1.status_code == 200:
+                    cache[f"air_quality:{lat}:{lon}"] = {'data': r1.json(), 'timestamp': datetime.now().timestamp()}
+                
+                # 2. Weather
+                r2 = await asyncio.to_thread(requests.get, f"{OPENWEATHER_BASE}/weather?lat={lat}&lon={lon}&appid={API_KEY}&units=metric", timeout=10.0)
+                if r2.status_code == 200:
+                    cache[f"weather:{lat}:{lon}"] = {'data': r2.json(), 'timestamp': datetime.now().timestamp()}
+                    
+                # 3. Air Forecast
+                r3 = await asyncio.to_thread(requests.get, f"{OPENWEATHER_BASE}/air_pollution/forecast?lat={lat}&lon={lon}&appid={API_KEY}", timeout=10.0)
+                if r3.status_code == 200:
+                    cache[f"air_forecast:{lat}:{lon}"] = {'data': r3.json(), 'timestamp': datetime.now().timestamp()}
+                    
+                # 4. Weather Forecast
+                r4 = await asyncio.to_thread(requests.get, f"{OPENWEATHER_BASE}/forecast?lat={lat}&lon={lon}&appid={API_KEY}&units=metric", timeout=10.0)
+                if r4.status_code == 200:
+                    cache[f"weather_forecast:{lat}:{lon}"] = {'data': r4.json(), 'timestamp': datetime.now().timestamp()}
+            except Exception as e:
+                print(f"⚠️ Pre-fetch failed for {city}: {e}")
+            await asyncio.sleep(1) # stagger requests to avoid rate limits
+        
+        # Run every 5 minutes
+        await asyncio.sleep(300)
+
+# ============================================================================
 # API Endpoints
 # ============================================================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize models on startup"""
-    print("🚀 Starting Urban Air Quality Sentinel v3.0 with Weaviate RAG...")
+    """Initialize models, Redis cache, and RAG system on startup"""
+    print("🚀 Starting Urban Air Quality Sentinel v3.0 with Weaviate RAG + Redis Caching...")
 
+    # Initialize ML models
     ml_pipeline.train_models()
 
+    # Initialize Weaviate RAG system
     try:
         rag_system.initialize()
     except Exception as e:
@@ -803,19 +1185,27 @@ async def startup_event():
         print(" Make sure Weaviate is running. For local instance:")
         print(" docker run -d -p 8080:8080 -e AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true semitechnologies/weaviate:latest")
 
+    # Initialize Redis cache for FAQ queries
+    redis_cache.connect()
+
+    # Load PM2.5 prediction model
     model_loaded = load_pm25_model()
     if not model_loaded:
         print("⚠️ WARNING: PM2.5 prediction model or scaler not loaded.")
         print(" The /predict_pm25 endpoint will not work.")
 
+    # Start background task for pre-fetching openweather data
+    asyncio.create_task(prefetch_all_city_data())
+
     print("✅ Server ready!")
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
+    """Cleanup on shutdown — close Weaviate and Redis connections"""
     print("🛑 Shutting down server...")
     if rag_system.is_initialized:
         rag_system.close()
+    redis_cache.close()
 
 @app.get("/")
 async def root():
@@ -849,11 +1239,11 @@ async def get_cities():
 
 @app.get("/current-air-quality", response_model=AirQualityResponse)
 async def get_current_air_quality(
-    city: str = Query("Lahore", description="City name"),
+    city: str = Query("Islamabad", description="City name"),
     lat: Optional[float] = None,
     lon: Optional[float] = None
 ):
-    """Get real-time air quality for a city"""
+    """Get real-time air quality for a city with graceful degradation"""
     try:
         if lat is None or lon is None:
             if city not in PAKISTAN_CITIES:
@@ -861,14 +1251,32 @@ async def get_current_air_quality(
             coords = PAKISTAN_CITIES[city]
             lat, lon = coords['lat'], coords['lon']
 
-        air_data = await fetch_air_quality_data(lat, lon)
-        weather_data = await fetch_weather_data(lat, lon)
-        air_forecast = await fetch_air_quality_forecast(lat, lon)
-        weather_forecast = await fetch_weather_forecast(lat, lon)
+        air_data, weather_data, air_forecast, weather_forecast = await asyncio.gather(
+            fetch_air_quality_data(lat, lon),
+            fetch_weather_data(lat, lon),
+            fetch_air_quality_forecast(lat, lon),
+            fetch_weather_forecast(lat, lon)
+        )
         parsed = parse_responses(air_data, weather_data, air_forecast, weather_forecast)
 
         aqi = calculate_aqi_from_pm25(parsed['pm25'])
         is_emergency = parsed['pm25'] > 300 or (parsed['pm25'] > 250 and parsed['wind_speed'] < 2.0)
+
+        risk_data = calculate_smog_risk(
+            parsed['pm25'], 
+            parsed['wind_speed'], 
+            parsed['humidity'], 
+            parsed['pressure'], 
+            parsed['temperature']
+        )
+        
+        future_pm25 = parsed['hourly_forecast']['pm25'][0] if parsed['hourly_forecast']['pm25'] else parsed['pm25']
+        trend = "stable"
+        if future_pm25 > parsed['pm25'] * 1.05:
+            trend = "rising"
+        elif future_pm25 < parsed['pm25'] * 0.95:
+            trend = "falling"
+        risk_data['smog_trend'] = trend
 
         historical_data.append({
             'city': city,
@@ -876,65 +1284,142 @@ async def get_current_air_quality(
             **parsed
         })
 
+        # Cache the latest data for graceful degradation fallback
+        cache[f"last_good:{city}"] = {
+            'data': parsed,
+            'aqi': aqi,
+            'is_emergency': is_emergency,
+            'risk_data': risk_data,
+            'timestamp': datetime.now().timestamp()
+        }
+
         return AirQualityResponse(
             city=city,
             timestamp=datetime.now().isoformat(),
             aqi=aqi,
             is_smog_emergency=is_emergency,
+            **risk_data,
             **{k: v for k, v in parsed.items() if k != 'hourly_forecast'}
         )
 
-    except HTTPException:
+    except HTTPException as he:
+        # Graceful degradation: try returning last known good data
+        if he.status_code == 503:
+            last_good = cache.get(f"last_good:{city}")
+            if last_good:
+                print(f"⚠️ API unavailable for {city}, returning last cached data")
+                risk_fb = last_good.get('risk_data') or calculate_smog_risk(0,0,0,0,0)
+                if 'smog_trend' not in risk_fb: risk_fb['smog_trend'] = 'stable'
+                return AirQualityResponse(
+                    city=city,
+                    timestamp=datetime.fromtimestamp(last_good['timestamp']).isoformat(),
+                    aqi=last_good['aqi'],
+                    is_smog_emergency=last_good['is_emergency'],
+                    **risk_fb,
+                    **{k: v for k, v in last_good['data'].items() if k != 'hourly_forecast'}
+                )
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        # Graceful degradation: try returning last known good data
+        last_good = cache.get(f"last_good:{city}")
+        if last_good:
+            print(f"⚠️ Error for {city}, returning last cached data: {e}")
+            risk_fb = last_good.get('risk_data') or calculate_smog_risk(0,0,0,0,0)
+            if 'smog_trend' not in risk_fb: risk_fb['smog_trend'] = 'stable'
+            return AirQualityResponse(
+                city=city,
+                timestamp=datetime.fromtimestamp(last_good['timestamp']).isoformat(),
+                aqi=last_good['aqi'],
+                is_smog_emergency=last_good['is_emergency'],
+                **risk_fb,
+                **{k: v for k, v in last_good['data'].items() if k != 'hourly_forecast'}
+            )
+        raise HTTPException(status_code=503, detail="Service not available, try again later!")
 
 @app.post("/rag-query", response_model=RAGQueryResponse)
 async def rag_query(request: RAGQueryRequest):
-    """RAG-powered Q&A endpoint using Weaviate + Groq"""
+    """RAG-powered Q&A endpoint with Redis caching and graceful degradation"""
+    import time
+    import logging
+    t0 = time.time()
     try:
-        if not rag_system.is_initialized:
-            raise HTTPException(status_code=503, detail="RAG system not initialized. Please ensure Weaviate is running.")
+        # --- Step 1: Check Redis cache for FAQ hit ---
+        cached_response = redis_cache.get_cached_response(request.question, request.city or "")
+        t1 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING: Redis cache took {t1 - t0:.3f}s\n")
+        if cached_response:
+            return RAGQueryResponse(
+                answer=cached_response['answer'],
+                sources=cached_response.get('sources', []),
+                source_ids=cached_response.get('source_ids', []),
+                similarity_scores=cached_response.get('similarity_scores', []),
+                timestamp=datetime.now().isoformat(),
+                current_data=cached_response.get('current_data')
+            )
 
+        # --- Step 2: Gather real-time city data ---
         current_data = None
-        if request.city and request.city in PAKISTAN_CITIES:
+        all_cities_data = []
+        
+        question_lower = request.question.lower()
+        mentioned_cities = []
+        for city in PAKISTAN_CITIES.keys():
+            if city.lower() in question_lower or (city == "Rawalpindi" and "pindi" in question_lower):
+                if city not in mentioned_cities:
+                    mentioned_cities.append(city)
+        
+        if not mentioned_cities and request.city and request.city in PAKISTAN_CITIES:
+            mentioned_cities.append(request.city)
+            
+        for city in mentioned_cities:
             try:
-                coords = PAKISTAN_CITIES[request.city]
-                air_data = await fetch_air_quality_data(coords['lat'], coords['lon'])
-                weather_data = await fetch_weather_data(coords['lat'], coords['lon'])
-                air_forecast = await fetch_air_quality_forecast(coords['lat'], coords['lon'])
-                weather_forecast = await fetch_weather_forecast(coords['lat'], coords['lon'])
+                coords = PAKISTAN_CITIES[city]
+                air_data, weather_data, air_forecast, weather_forecast = await asyncio.gather(
+                    fetch_air_quality_data(coords['lat'], coords['lon']),
+                    fetch_weather_data(coords['lat'], coords['lon']),
+                    fetch_air_quality_forecast(coords['lat'], coords['lon']),
+                    fetch_weather_forecast(coords['lat'], coords['lon'])
+                )
                 parsed = parse_responses(air_data, weather_data, air_forecast, weather_forecast)
-                parsed['city'] = request.city
+                parsed['city'] = city
                 parsed['aqi'] = calculate_aqi_from_pm25(parsed['pm25'])
-                current_data = parsed
+                all_cities_data.append(parsed)
+                if city == request.city:
+                    current_data = parsed
             except:
                 pass
 
-        relevant_docs = rag_system.retrieve_relevant(request.question, top_k=request.top_k)
+        t2 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING: OpenWeather data gather took {t2 - t1:.3f}s\n")
 
-        if not relevant_docs:
-            return RAGQueryResponse(
-                answer="I couldn't find relevant information in my knowledge base for this question. Please try rephrasing.",
-                sources=[],
-                source_ids=[],
-                similarity_scores=[],
-                timestamp=datetime.now().isoformat(),
-                current_data=current_data
-            )
-
-        result = await rag_system.generate_answer(
-            request.question,
-            relevant_docs,
-            current_data,
-            request.language
+        # --- Step 3: Execute RAG with graceful degradation ---
+        result = await degradation_service.execute_with_fallback(
+            rag_system=rag_system,
+            query=request.question,
+            city=request.city or "Islamabad",
+            top_k=request.top_k,
+            current_data=current_data,
+            all_cities_data=all_cities_data,
+            language=request.language
         )
+        t3 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING: RAG execution took {t3 - t2:.3f}s\n")
+
+        # --- Step 4: Cache successful response in Redis ---
+        response_to_cache = {
+            'answer': result['answer'],
+            'sources': result.get('sources', []),
+            'source_ids': result.get('source_ids', []),
+            'similarity_scores': result.get('similarity_scores', []),
+            'current_data': {k: v for k, v in (current_data or {}).items() 
+                           if k != 'hourly_forecast'} if current_data else None
+        }
+        if result.get('tier', 4) <= 2:
+            redis_cache.cache_response(request.question, request.city or "", response_to_cache)
+        t4 = time.time(); open('/tmp/rag_timing.log', 'a').write(f"TIMING: Total request took {t4 - t0:.3f}s\n")
 
         return RAGQueryResponse(
             answer=result['answer'],
-            sources=result['sources'],
-            source_ids=result['source_ids'],
-            similarity_scores=result['similarity_scores'],
+            sources=result.get('sources', []),
+            source_ids=result.get('source_ids', []),
+            similarity_scores=result.get('similarity_scores', []),
             timestamp=datetime.now().isoformat(),
             current_data=current_data
         )
@@ -942,15 +1427,24 @@ async def rag_query(request: RAGQueryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"RAG query failed: {str(e)}")
+        # Final fallback — return service unavailable
+        print(f"⚠️ RAG query completely failed: {e}")
+        return RAGQueryResponse(
+            answer=degradation_service.service_unavailable_message(),
+            sources=[],
+            source_ids=[],
+            similarity_scores=[],
+            timestamp=datetime.now().isoformat(),
+            current_data=None
+        )
 
 @app.get("/smog-forecast", response_model=ForecastResponse)
 async def forecast_smog(
-    city: str = Query("Lahore"),
+    city: str = Query("Islamabad"),
     lat: Optional[float] = None,
     lon: Optional[float] = None
 ):
-    """48-hour smog forecast"""
+    """48-hour smog forecast with graceful degradation"""
     try:
         if lat is None or lon is None:
             if city not in PAKISTAN_CITIES:
@@ -958,10 +1452,12 @@ async def forecast_smog(
             coords = PAKISTAN_CITIES[city]
             lat, lon = coords['lat'], coords['lon']
 
-        air_data = await fetch_air_quality_data(lat, lon)
-        weather_data = await fetch_weather_data(lat, lon)
-        air_forecast = await fetch_air_quality_forecast(lat, lon)
-        weather_forecast = await fetch_weather_forecast(lat, lon)
+        air_data, weather_data, air_forecast, weather_forecast = await asyncio.gather(
+            fetch_air_quality_data(lat, lon),
+            fetch_weather_data(lat, lon),
+            fetch_air_quality_forecast(lat, lon),
+            fetch_weather_forecast(lat, lon)
+        )
         parsed = parse_responses(air_data, weather_data, air_forecast, weather_forecast)
 
         hourly = parsed['hourly_forecast']
@@ -1002,8 +1498,14 @@ async def forecast_smog(
             average_confidence=avg_confidence
         )
 
+    except HTTPException as he:
+        if he.status_code == 404:
+            raise
+        # Graceful degradation for forecast
+        raise HTTPException(status_code=503, detail="Service not available, try again later!")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Forecast failed: {str(e)}")
+        print(f"⚠️ Forecast failed for {city}: {e}")
+        raise HTTPException(status_code=503, detail="Service not available, try again later!")
 
 @app.post("/predict_pm25", response_model=PredictionResponse)
 async def predict_pm25_endpoint(data: PredictionInput):
@@ -1097,7 +1599,7 @@ async def get_weaviate_stats():
             "embedding_model": rag_system.model_name,
             "total_documents": response.total_count,
             "categories": list(set(doc['category'] for doc in KNOWLEDGE_BASE)),
-            "llm_model": "llama-3.3-70b-versatile"
+            "llm_model": "llama-3.1-8b-instant"
         }
     except Exception as e:
         return {
@@ -1107,7 +1609,7 @@ async def get_weaviate_stats():
 
 @app.get("/health")
 async def health_check():
-    """System health check"""
+    """System health check — includes Redis status"""
     weaviate_status = "healthy" if rag_system.is_initialized else "not_initialized"
 
     return {
@@ -1126,6 +1628,11 @@ async def health_check():
             "embedding_model": rag_system.model_name if rag_system.is_initialized else None,
             "documents": len(rag_system.knowledge_base),
             "weaviate_url": WEAVIATE_URL
+        },
+        "redis_cache": {
+            "status": "connected" if redis_cache.is_connected else "disconnected",
+            "url": redis_cache.redis_url,
+            "ttl_seconds": redis_cache.default_ttl
         },
         "data": {
             "historical_records": len(historical_data),
