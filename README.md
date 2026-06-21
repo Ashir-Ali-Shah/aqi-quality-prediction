@@ -1,111 +1,69 @@
-# 🌫️ Urban Air Quality Sentinel
+# Urban Air Quality Sentinel
 
-    
 **A Full-Stack AI System for Real-time Smog Detection, Forecasting, and Health Assistance.**
 
-**Air Quality Sentinel** is a production-ready application designed to monitor and predict PM2.5 levels in major Pakistani cities. It combines real-time data ingestion, a highly optimized Random Forest forecasting engine, and a RAG (Retrieval-Augmented Generation) chatbot to provide actionable health advice.
+Air Quality Sentinel is a complete application that tracks air quality in major cities. It features an advanced AI Health Assistant, a fast machine learning forecasting engine, and a live data dashboard.
 
-## 📊 Quantitative Model Performance
+## The Advanced RAG AI Assistant
 
-The core of this system is a **Random Forest Regressor (200 estimators)** optimized for low-latency inference. Below are real-world inference metrics captured during system validation.
+Our system features a highly robust Retrieval-Augmented Generation (RAG) architecture. This acts as the brain of the application, giving users instant, scientifically accurate health advice based on real-time air quality. 
 
-### 1\. Inference Speed & Efficiency
+### How It Works
 
-The model utilizes `joblib` with a threading backend to parallelize predictions, ensuring real-time responsiveness for the user dashboard.
+The AI system is built on three core components:
+1. **The Static Knowledge:** Health and science articles are stored securely in a Weaviate vector database.
+2. **The Dynamic Context:** Real-time city weather and air quality metrics are fetched continuously.
+3. **The Brain:** The Groq LLM (llama-3.1-8b-instant) combines the static health articles with the live weather data to create a concise, up-to-the-minute answer for the user.
 
-| Metric | Value | Description |
-| :--- | :--- | :--- |
-| **Inference Latency** | **\~0.1s** | Ultra-low latency prediction time per request. |
-| **Estimators** | **200** | Number of decision trees in the ensemble model. |
-| **Concurrency** | **2 Workers** | Parallel processing enabled for scalability. |
+### Performance and Evaluation
 
-### 2\. Prediction Case Studies (Real Logs)
+The entire application runs seamlessly using Docker. We evaluate the AI's performance using Langsmith. Recent evaluation tests scored an impressive **0.85 out of 1.0**. 
 
-The model demonstrates high sensitivity to meteorological changes (Temperature vs. Humidity correlations).
+Our AI generates text at lightning speed:
+* **Generation Speed:** 211.2 Tokens Per Second (TPS).
+* **Responsiveness:** 313ms Time-to-First-Token (TTFT).
 
-**Case A: Moderate Heat, High Humidity**
-*Input:* `PM10: 85`, `NO2: 52`, `CO: 720`, `Temp: 28°C`, `Humidity: 65%`
+This means the user gets an ultra-responsive experience with almost no waiting time. There is only a very minor, acceptable delay during the initial database search.
 
-> **Result:** The model correctly identifies the compounding effect of humidity on particulate matter.
->
->   * **Predicted PM2.5:** `64.01 μg/m³`
->   * **AQI:** `155` (Unhealthy)
+### Graceful Degradation and Stability
 
-**Case B: High Heat, Lower Humidity**
-*Input:* `PM10: 67`, `NO2: 60`, `CO: 680`, `Temp: 39°C`, `Humidity: 49%`
+To make sure the application never crashes if an external API goes down, we built an impressive 4-tier safety net:
+* **Tier 1 (Normal Operation):** Full pipeline using Weaviate and the Groq LLM.
+* **Tier 2 (LLM Down):** If the AI generator fails, the system safely displays raw retrieved text snippets from the database.
+* **Tier 3 (Database Down):** If the database fails, the system falls back to local Python keyword matching on a backup file.
+* **Tier 4 (All Systems Down):** Returns a clean and polite "Service unavailable" message to the user.
 
-> **Result:** Despite high PM10 inputs, the model recognizes that higher temperatures can aid dispersion, resulting in a slightly lower risk category.
->
->   * **Predicted PM2.5:** `54.99 μg/m³`
->   * **AQI:** `149` (Unhealthy for Sensitive Groups)
+We also use Redis caching and background pre-fetching. This keeps the application lightning fast and reduces API costs.
 
------
+### Technical Architecture Insights
 
-## 🚀 Key Features
+When designing this system, several key engineering choices were made:
+* **Hybrid Search and Cross-Encoders:** We combine the exactness of keyword search with the context of semantic search. The cross-encoder then guarantees that only the most relevant document gets passed to the AI.
+* **Handling Latency and Rate Limits:** We handle this through our safety net tiers, Redis caching for common questions, and continuous background data prefetching.
 
-  * **🌍 Real-Time Monitoring:** Live tracking of AQI, PM2.5, PM10, and meteorological conditions using the OpenWeatherMap API.
-  * **🔮 48-Hour Forecasting:** Machine Learning pipeline to predict smog risk hours up to 48 hours in advance.
-  * **🤖 AI Health Assistant:** A **RAG-powered chatbot** (Weaviate & Groq LLaMA 3) that answers user queries based on a scientific knowledge base.
-  * **📊 Interactive Dashboard:** A responsive React frontend featuring data visualization (Recharts) and dynamic smog alert indicators.
-  * **📈 Custom Predictive Tool:** Users can manually input pollutant/weather variables to simulate AQI scenarios (as seen in the metrics above).
-  * **🐳 Fully Dockerized:** Seamless deployment and orchestration using Docker and Docker Compose.
+## Project Features and Forecasting
 
------
+While the RAG AI is the star of the show, the rest of the project is equally robust.
 
-## 🛠️ Tech Stack
+### Machine Learning Forecasting
+Instead of using slow and expensive LLMs for predicting numerical data, we use standard Machine Learning models like Random Forest. Traditional ML is much better, faster, and cheaper for time-series forecasting. Our Random Forest Regressor provides 48-hour smog risk predictions with ultra-low latency (around 0.1 seconds per request).
 
-| Category | Technologies |
-| :--- | :--- |
-| **Frontend** | React.js (Hooks, Context), Tailwind CSS, Recharts |
-| **Backend** | FastAPI, Uvicorn, Python 3.9 |
-| **ML Engine** | **Scikit-Learn (Random Forest)**, Joblib (Parallelization), Pandas |
-| **AI & RAG** | Weaviate (Vector DB), Sentence Transformers, Groq API (LLaMA 3) |
-| **DevOps** | Docker, Docker Compose, Nginx |
+### Live Dashboard
+* **Real-Time Monitoring:** Live tracking of AQI, PM2.5, PM10, and weather using the OpenWeatherMap API.
+* **Interactive Interface:** A responsive React frontend featuring data visualizations with Recharts and dynamic smog alerts.
+* **Custom Tools:** Users can manually input pollutant variables to simulate different air quality scenarios.
 
------
+## Tech Stack
 
-## ⚡ Quick Start
+* **Frontend:** React.js, Tailwind CSS, Recharts
+* **Backend:** FastAPI, Python 3.9
+* **ML Engine:** Scikit-Learn (Random Forest)
+* **AI and Database:** Weaviate, Groq API (LLaMA 3)
+* **DevOps:** Docker, Docker Compose, Redis
 
-### 1\. Prerequisites
+## Quick Start
 
-  * Docker & Docker Compose
-  * Git
-
-### 2\. Clone & Configure
-
-```bash
-git clone https://github.com/Ashir-Ali-Shah/aqi-quality-project.git
-cd aqi-quality-project
-```
-
-*Update `docker-compose.yml` with your `GROQ_API_KEY` and `OPENWEATHER_API_KEY`.*
-
-### 3\. Build & Run
-
-```bash
-docker-compose up --build
-```
-
-### 4\. Access Points
-
-  * 🖥️ **Dashboard:** `http://localhost:3000`
-  * 📄 **API Docs:** `http://localhost:8000/docs`
-  * 🧠 **Vector DB:** `http://localhost:8080`
-
------
-
-## 📂 Project Structure
-
-```bash
-air-quality-project/
-├── docker-compose.yml       # Orchestration
-├── backend/                 # FastAPI & ML Logic
-│   ├── backend.py           # API Endpoints
-│   ├── ml_pipeline.py       # Random Forest Implementation
-│   ├── scaler.pkl           # Pre-trained Feature Scaler
-│   └── Dockerfile           # Backend Config
-└── frontend/                # React Dashboard
-    ├── src/
-    │   ├── SmogSentinelTabs.js # Visualization Logic
-    └── Dockerfile           # Frontend Config
-```
+1. Clone the repository.
+2. Update the `docker-compose.yml` file with your API keys.
+3. Run `docker compose up --build -d`.
+4. Access the dashboard at `http://localhost:3000`.

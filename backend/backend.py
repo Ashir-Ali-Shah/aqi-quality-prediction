@@ -23,6 +23,7 @@ import joblib
 import redis
 import requests
 import socket
+from langsmith import traceable
 
 # Monkey-patch socket to force IPv4 to prevent 5-second Docker Desktop IPv6 DNS timeouts
 orig_getaddrinfo = socket.getaddrinfo
@@ -36,7 +37,7 @@ os.environ["GRPC_DNS_RESOLVER"] = "native"
 # ML and RAG imports
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingClassifier
 from sklearn.preprocessing import StandardScaler
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 import weaviate
 from weaviate.classes.init import Auth
 from weaviate.classes.query import MetadataQuery
@@ -385,6 +386,7 @@ class WeaviateRAGSystem:
         self.knowledge_base = knowledge_base
         self.model_name = model_name
         self.embedding_model = None
+        self.cross_encoder = None
         self.weaviate_client = None
         self.collection_name = "AirQualityKnowledge"
         self.is_initialized = False
@@ -395,6 +397,9 @@ class WeaviateRAGSystem:
 
         print(f" Loading embedding model: {self.model_name}...")
         self.embedding_model = SentenceTransformer(self.model_name)
+        
+        print(f" Loading cross-encoder model: cross-encoder/ms-marco-MiniLM-L-6-v2...")
+        self.cross_encoder = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
         print(f" Connecting to Weaviate at {WEAVIATE_URL}...")
         try:
@@ -493,39 +498,90 @@ class WeaviateRAGSystem:
 
         print(f" ✅ Successfully indexed {len(documents_data)} documents!")
 
+    @traceable(name="expand_query", run_type="llm")
+    def _expand_query(self, query: str) -> str:
+        """Expand query using Groq API to include synonyms and related terms for better hybrid search."""
+        system_prompt = "You are an expert search query expander. Given a user query about air quality in Pakistan, generate 2-3 related synonyms or variations to improve search recall. Return ONLY the expanded keywords separated by spaces. Do not include the original query, introductions, or explanations."
+        try:
+            response = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"Query: {query}"}
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": 30
+                },
+                timeout=10.0
+            )
+            if response.status_code == 200:
+                result = response.json()
+                expanded = result['choices'][0]['message']['content'].strip()
+                print(f"🔄 Query Expanded: '{query}' -> '{expanded}'")
+                return f"{query} {expanded}"
+        except Exception as e:
+            print(f"⚠️ Query expansion failed: {e}")
+            
+        return query
+
+    @traceable(name="retrieve_relevant", run_type="retriever")
     def retrieve_relevant(self, query: str, top_k: int = 3) -> List[Dict]:
-        """Retrieve top-k most relevant documents using Weaviate vector search"""
+        """Retrieve top-k most relevant documents using Hybrid Search + Cross-Encoder Reranking"""
         if not self.is_initialized:
             raise ValueError("RAG system not initialized. Call initialize() first.")
 
+        # Step 1: Query Expansion
+        expanded_query = self._expand_query(query)
+
+        # Step 2: Hybrid Search (Retrieve broader set of candidates)
+        expanded_k = max(10, top_k * 3)
         query_embedding = self.embedding_model.encode(
-            [query],
+            [query],  # Embed the original query, not the expanded one
             convert_to_numpy=True
         )[0]
 
         collection = self.weaviate_client.collections.get(self.collection_name)
 
-        response = collection.query.near_vector(
-            near_vector=query_embedding.tolist(),
-            limit=top_k,
-            return_metadata=MetadataQuery(distance=True)
+        response = collection.query.hybrid(
+            query=expanded_query,
+            vector=query_embedding.tolist(),
+            limit=expanded_k,
+            alpha=0.5,
+            return_metadata=MetadataQuery(score=True)
         )
 
-        results = []
+        candidates = []
         for obj in response.objects:
-            similarity = 1 - (obj.metadata.distance / 2)
-
-            results.append({
+            candidates.append({
                 'id': obj.properties['doc_id'],
                 'title': obj.properties['title'],
                 'content': obj.properties['content'],
                 'category': obj.properties['category'],
                 'keywords': obj.properties['keywords'],
-                'similarity_score': float(similarity)
+                'hybrid_score': obj.metadata.score if obj.metadata.score else 0.0
             })
 
-        return results
+        if not candidates:
+            return []
 
+        # Step 3: Cross-Encoder Reranking
+        pairs = [[query, doc['content']] for doc in candidates]
+        cross_scores = self.cross_encoder.predict(pairs)
+
+        for doc, score in zip(candidates, cross_scores):
+            doc['similarity_score'] = float(score)
+
+        # Step 4: Sort by cross-encoder score and keep top_k
+        candidates.sort(key=lambda x: x['similarity_score'], reverse=True)
+        return candidates[:top_k]
+
+    @traceable(name="generate_answer", run_type="llm")
     async def generate_answer(
         self,
         query: str,
@@ -759,6 +815,7 @@ class GracefulDegradationService:
         """Tier 4: Final fallback message"""
         return "Service not available, try again later!"
 
+    @traceable(name="execute_with_fallback", run_type="chain")
     async def execute_with_fallback(
         self,
         rag_system,

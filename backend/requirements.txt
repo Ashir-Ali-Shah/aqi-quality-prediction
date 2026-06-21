@@ -9,3 +9,7 @@ weaviate-client
 joblib
 pydantic
 redis[hiredis]
+langsmith
+langchain-core
+langchain-groq
+python-dotenv
